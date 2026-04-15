@@ -35,3 +35,6 @@ Pillow>=10.0.0
 # --- Config / schema ---
 python-dotenv>=1.0.0
 pydantic>=2.0.0,<3
+
+# --- Compatibility fix (Streamlit Cloud / chromadb telemetry stack) ---
+protobuf>=3.20.3,<4.0.0
