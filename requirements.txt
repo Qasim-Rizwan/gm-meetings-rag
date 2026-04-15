@@ -1,0 +1,37 @@
+# GM Meetings RAG — Streamlit + CLI
+# Python3.11–3.13 recommended (matches Streamlit Community Cloud).
+# Install: pip install -r requirements.txt
+
+# --- Web ---
+streamlit>=1.40.0,<2
+
+# --- LangChain ---
+langchain>=1.2.0,<2
+langchain-community>=0.4.0
+langchain-core>=1.2.0,<2
+langchain-text-splitters>=1.1.0,<2
+langchain-huggingface>=1.2.0,<2
+langchain-chroma>=1.1.0,<2
+langchain-groq>=1.1.0,<2
+
+# --- Vector store ---
+chromadb>=1.0.0,<2
+
+# --- Embeddings / HF stack (downloads model on first run unless HF_OFFLINE=1) ---
+sentence-transformers>=2.7.0
+torch>=2.0.0,<3
+transformers>=4.40.0
+huggingface_hub>=0.23.0
+
+# --- LLM API (ingest --groq-vision; transitive for langchain-groq) ---
+groq>=0.37.0
+
+# --- PDF + chart OCR (ingest.py; not required at runtime for Streamlit query-only) ---
+pypdf>=4.0.0
+pymupdf>=1.24.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
+# --- Config / schema ---
+python-dotenv>=1.0.0
+pydantic>=2.0.0,<3

@@ -1,0 +1,25 @@
+# Local secrets — never commit real keys
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Streamlit local secrets (Cloud uses dashboard instead)
+.streamlit/secrets.toml
+
+# Optional: exclude huge local index from git (then deploy index via LFS or CI)
+# chroma_db/
