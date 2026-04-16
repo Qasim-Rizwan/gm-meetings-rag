@@ -37,12 +37,14 @@ logger.setLevel(logging.INFO)
 logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 logging.getLogger("chromadb").setLevel(logging.ERROR)
 
+import json
+
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
-from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.output_parsers import StrOutputParser
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -63,7 +65,8 @@ YEAR_LOCATIONS = {"2022": "Rome", "2023": "Budapest", "2024": "Alcoy", "2025": "
 DENSE_TOP_K  = 20
 BM25_TOP_K   = 20
 RRF_K        = 60   # RRF smoothing constant — higher = flatter score distribution
-RERANK_TOP_N = 7    # chunks actually sent to the LLM
+RERANK_TOP_N      = 7   # default chunks sent to LLM
+RERANK_TOP_N_LIST = 12  # increased for "list all / extract all" queries
 
 # Multi-query expansion — rule-based rephrasings to widen recall; set 0 to disable
 MULTI_QUERY_N = 2
@@ -111,6 +114,8 @@ INTENT_KEYWORDS: Dict[str, List[str]] = {
     "marketing":      ["marketing", "campaign", "brand", "communication", "promotion", "awareness"],
     "quality":        ["quality", "audit", "control", "certificate", "compliance", "round robin", "testing"],
     "sustainability": ["sustainability", "environment", "climate", "carbon", "green", "emission"],
+    "list_all":       ["list all", "all feedback", "all comments", "all mentions", "extract all",
+                       "all proposals", "all decisions", "all issues", "all points"],
 }
 
 # Maps doc_type values to trigger keywords for auto-detection
@@ -415,43 +420,56 @@ class Reranker:
 
     def rerank(
         self, question: str, docs: List[Document], top_n: int = RERANK_TOP_N
-    ) -> List[Document]:
+    ) -> List[Tuple[float, Document]]:
+        """Return list of (score, doc) tuples sorted by score desc, capped at top_n."""
         if not docs:
-            return docs
+            return []
         if self.model is None:
             logger.warning("[Reranker] Skipped — returning top-n by RRF rank.")
-            return docs[:top_n]
+            return [(0.0, d) for d in docs[:top_n]]
 
         pairs  = [(question, doc.page_content) for doc in docs]
         scores = self.model.predict(pairs)
         scored = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+        top    = scored[:top_n]
 
-        top = scored[:top_n]
         logger.info(
             "[Reranker] Scores: " + " | ".join(
                 f"{s:.3f} [{d.metadata.get('year')}/{d.metadata.get('doc_type')}]"
                 for s, d in top
             )
         )
-        return [doc for _, doc in top]
+        return top
 
 
 # ── Context Builder ────────────────────────────────────────────────────────────
 
 class ContextBuilder:
     """
-    Formats reranked chunks into a numbered context block for the LLM.
-    Includes all key metadata as a header so the model can cite sources correctly.
+    Formats reranked (score, doc) pairs into a numbered context block for the LLM.
+    Includes a relevance tier tag so the LLM can calibrate confidence correctly:
+      [HIGHLY RELEVANT] score > 3.0
+      [RELEVANT]        score 0.0 – 3.0
+      [MARGINAL]        score < 0.0
     """
 
     @staticmethod
-    def build(docs: List[Document]) -> str:
+    def _relevance_tag(score: float) -> str:
+        if score > 3.0:
+            return " [HIGHLY RELEVANT]"
+        if score >= 0.0:
+            return " [RELEVANT]"
+        return " [MARGINAL]"
+
+    @classmethod
+    def build(cls, scored_docs: List[Tuple[float, Document]]) -> str:
         parts: List[str] = []
-        for i, doc in enumerate(docs, 1):
-            m       = doc.metadata
-            ocr_tag = " [CHART-OCR]" if m.get("has_chart_ocr") == "True" else ""
-            header  = (
-                f"[Chunk {i}{ocr_tag}] "
+        for i, (score, doc) in enumerate(scored_docs, 1):
+            m         = doc.metadata
+            ocr_tag   = " [CHART-OCR]" if m.get("has_chart_ocr") == "True" else ""
+            rel_tag   = cls._relevance_tag(score)
+            header    = (
+                f"[Chunk {i}{ocr_tag}{rel_tag}] "
                 f"Year={m.get('year', '?')} | "
                 f"Location={m.get('location', '?')} | "
                 f"Type={m.get('doc_type', '?')} | "
@@ -474,36 +492,59 @@ covering 2022–2025 (Rome 2022, Budapest 2023, Alcoy 2024, Copenhagen 2025).
 2. If the answer is not present in the context, respond with exactly:
    "This information is not found in the provided documents."
 3. Do NOT infer, extrapolate, or generalise beyond what the documents state.
-4. Do NOT mix up years — every factual claim must be tagged to its exact year.
-5. If context partially answers the question, cover the supported part and
+4. Do NOT mix up years — every factual claim must be attributed to its exact year.
+5. If context partially answers the question, answer the supported part and
    explicitly note: "Information about [X] was not found in the documents."
 6. Prefer saying "not found" over guessing.
+
+━━ SYNTHESIS REQUIREMENT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Extract and present SPECIFIC facts, names, decisions, numbers, and statements
+  from the documents. Do NOT describe document processes or restate what was
+  "presented" or "discussed" — write the ACTUAL CONTENT instead.
+  ✗ BAD:  "The 2023 presentation discussed the MADE IN GREEN roadmap."
+  ✓ GOOD: "The 2023 Budapest presentation proposed removing wet-spinning
+          exclusions from MADE IN GREEN Standard 01.2024."
+- If a document mentions explicit quotes or decisions from named institutes,
+  reproduce them directly.
+- Be specific and thorough; avoid vague summaries.
+
+━━ CHRONOLOGICAL ORDER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- When the answer spans multiple years, always present information in
+  chronological order (oldest year first: 2022 → 2023 → 2024 → 2025).
+- Clearly label each year transition (e.g. "In 2022 (Rome):", "In 2023 (Budapest):").
 
 ━━ NUMERICAL / CHART DATA ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - Chunks tagged [CHART-OCR] contain machine-read chart/table data.
   OCR may have minor recognition errors — cross-check figures when possible.
 - For rate/percentage/count/ranking questions, prioritise [CHART-OCR] chunks.
 - Quote exact numbers and show any derived calculations step-by-step.
-- Explicitly label which year each data point belongs to.
 
 ━━ CONFIDENCE CALIBRATION ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- high   : 3+ strongly relevant chunks provide consistent support.
-- medium : 1–2 relevant chunks, or partial coverage only.
-- low    : Single weak chunk, indirect evidence, or inferred from context.
-  → When confidence = low, state the uncertainty explicitly in "answer".
+Base confidence on ANSWER COMPLETENESS — not on chunk count:
+- high   : You were able to form a COMPLETE, SPECIFIC, DIRECTLY SUPPORTED answer.
+           The context contains explicit statements addressing the question.
+           Use this whenever the question is clearly answered by the documents.
+- medium : The answer is PARTIALLY supported. Some aspect of the question is
+           answered but there are clear gaps, or information is indirect.
+- low    : The evidence is WEAK, VAGUE, or only tangentially related.
+           → When confidence = low, state the uncertainty explicitly in "answer".
+
+Context chunks tagged [HIGHLY RELEVANT] directly address the question.
+Context chunks tagged [RELEVANT] provide useful supporting information.
+Context chunks tagged [MARGINAL] have weak relevance — use them only if
+  they add specific facts not covered by higher-tier chunks.
 
 ━━ REQUIRED JSON OUTPUT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Return ONLY a valid JSON object matching this schema exactly:
-{schema}
+Return ONLY a valid JSON object with EXACTLY these six keys:
 
-Field guidelines:
-  "answer"         — 2–4 paragraphs. Cite year + location for every claim.
-  "key_points"     — 3–6 bullets. Each must start with an action verb.
-  "relevant_years" — Only years explicitly mentioned in your answer.
-  "document_types" — All distinct source doc types you drew from.
-  "sources"        — All filenames cited (no paths, no duplicates).
-  "confidence"     — Calibrated per rules above; note uncertainty in answer
-                     if low.
+{{
+  "answer":         "<string — 2-4 paragraphs. Cite year+location per claim. Chronological. Synthesize specifics.>",
+  "key_points":     ["<3-6 bullets starting with action verbs. Include concrete facts.>"],
+  "relevant_years": ["<only years actually mentioned in your answer e.g. '2023'>"],
+  "document_types": ["<distinct source doc types referenced>"],
+  "sources":        ["<unique filenames cited, no paths>"],
+  "confidence":     "<one of: high | medium | low based on answer completeness>"
+}}
 
 ━━ CONTEXT (pre-filtered + reranked for relevance) ━━━━━━━━━━━━━━━━━━━━━━━━━━
 {context}
@@ -511,31 +552,55 @@ Field guidelines:
 
 HUMAN_PROMPT = "Question: {question}"
 
+_FALLBACK_RESPONSE = GMResponse(
+    answer="Unable to generate a structured response. Please rephrase your question and try again.",
+    key_points=["Response parsing failed — please try again."],
+    relevant_years=[],
+    document_types=[],
+    sources=[],
+    confidence="low",
+)
+
 
 # ── Generator ──────────────────────────────────────────────────────────────────
 
 class Generator:
-    """Invokes Groq Llama with the formatted context and parses the structured response."""
+    """
+    Invokes Groq Llama in JSON mode (response_format=json_object) and parses
+    the response manually — avoids the verbose schema instructions that confuse
+    the LLM when using JsonOutputParser(pydantic_object=...).
+    """
 
     def __init__(self, llm: ChatGroq) -> None:
         self.llm    = llm
-        self.parser = JsonOutputParser(pydantic_object=GMResponse)
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", SYSTEM_PROMPT),
             ("human",  HUMAN_PROMPT),
         ])
+        self._chain = self.prompt | self.llm | StrOutputParser()
 
     def generate(self, question: str, context: str) -> GMResponse:
-        schema = self.parser.get_format_instructions()
-        chain  = self.prompt | self.llm | self.parser
-        result = chain.invoke({
-            "schema":   schema,
-            "context":  context,
-            "question": question,
-        })
-        if isinstance(result, dict):
-            return GMResponse(**result)
-        return result  # type: ignore[return-value]
+        import time as _time
+
+        for attempt in range(2):
+            try:
+                raw = self._chain.invoke({"context": context, "question": question})
+                # Strip markdown code fences if present
+                raw = raw.strip()
+                if raw.startswith("```"):
+                    raw = raw.split("```", 2)[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                    raw = raw.rsplit("```", 1)[0].strip()
+                data = json.loads(raw)
+                return GMResponse(**data)
+            except Exception as exc:
+                if attempt == 0:
+                    logger.warning(f"[Generator] Parse error (attempt 1): {exc}. Retrying in 3s …")
+                    _time.sleep(3)
+                    continue
+                logger.error(f"[Generator] Parse failed after retry: {exc}")
+                return _FALLBACK_RESPONSE
 
 
 # ── Main Engine ────────────────────────────────────────────────────────────────
@@ -605,7 +670,13 @@ class GMRagEngine:
             sys.exit(1)
 
         print(f"[RAG] Connecting to Groq / Llama ({GROQ_MODEL}) …")
-        llm = ChatGroq(model=GROQ_MODEL, groq_api_key=api_key, temperature=0.1)
+        # response_format json_object forces Groq to always return valid JSON
+        llm = ChatGroq(
+            model=GROQ_MODEL,
+            groq_api_key=api_key,
+            temperature=0.1,
+            model_kwargs={"response_format": {"type": "json_object"}},
+        )
         self.generator = Generator(llm)
         print("[RAG] Ready.\n")
 
@@ -644,21 +715,21 @@ class GMRagEngine:
                 confidence="low",
             )
 
-        # ── Rerank ────────────────────────────────────────────────────────────
-        top_docs = self.reranker.rerank(question, candidates, top_n=RERANK_TOP_N)
+        # ── Rerank (adaptive top_n) ────────────────────────────────────────────
+        # "list all" intent needs a wider context window to capture all mentions
+        top_n = RERANK_TOP_N_LIST if query_ctx.intent == "list_all" else RERANK_TOP_N
+        scored_docs = self.reranker.rerank(question, candidates, top_n=top_n)
 
-        logger.info(f"[Engine] {len(top_docs)} chunks → LLM")
-        for i, d in enumerate(top_docs, 1):
+        logger.info(f"[Engine] {len(scored_docs)} chunks → LLM (intent={query_ctx.intent})")
+        for i, (sc, d) in enumerate(scored_docs, 1):
             logger.info(
-                f"  [{i}] year={d.metadata.get('year')} | "
+                f"  [{i}] score={sc:.3f} | year={d.metadata.get('year')} | "
                 f"type={d.metadata.get('doc_type')} | "
-                f"file={d.metadata.get('filename')} | "
-                f"pg={d.metadata.get('page')} | "
-                f"ocr={d.metadata.get('has_chart_ocr')}"
+                f"file={d.metadata.get('filename')} | pg={d.metadata.get('page')}"
             )
 
         # ── Build context + generate ──────────────────────────────────────────
-        context  = self.ctx_builder.build(top_docs)
+        context  = self.ctx_builder.build(scored_docs)
         response = self.generator.generate(question, context)
         return response
 
