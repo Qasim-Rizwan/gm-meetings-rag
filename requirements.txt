@@ -23,6 +23,9 @@ torch>=2.0.0,<3
 transformers>=4.40.0
 huggingface_hub>=0.23.0
 
+# --- Hybrid retrieval (BM25 sparse search) ---
+rank-bm25>=0.2.2
+
 # --- LLM API (ingest --groq-vision; transitive for langchain-groq) ---
 groq>=0.37.0
 

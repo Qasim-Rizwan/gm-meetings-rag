@@ -1,22 +1,21 @@
 """
-GM Meetings RAG - Ingestion Pipeline (v4 — Local OCR for charts)
-================================================================
-Loads all PDF documents from the yearly GM Meeting folders,
-detects chart/image-heavy pages, extracts visible text from those
-slides with **local Tesseract OCR** (no cloud API, no rate limits),
-and persists everything to a ChromaDB vector store.
-
-Optional: `--groq-vision` uses Groq Llama 4 Scout instead of OCR(if you have quota). Use `GROQ_VISION_DELAY` seconds between calls
-to reduce429 errors.
+GM Meetings RAG — Ingestion Pipeline (v5 — Production Chunking)
+===============================================================
+Changes from v4:
+  - Chunk size reduced to ~400 tokens (1600 chars) with 80-token overlap
+  - ALL pages are always split — no more "keep whole" exceptions
+  - OCR text is split separately from base page text to avoid bloated chunks
+  - Each chunk produced from an OCR section carries has_chunk_type="ocr"
+  - Chunk index metadata added for debugging
 
 Run:
-    python ingest.py --rebuild              # default: Tesseract OCR on charts
-    python ingest.py --rebuild --no-chart-ocr   # skip chart enrichment entirely
-    python ingest.py --rebuild --groq-vision    # cloud vision (rate-limited)
+    python ingest.py --rebuild              # Tesseract OCR on chart slides
+    python ingest.py --rebuild --no-chart-ocr
+    python ingest.py --rebuild --groq-vision
 
-Requires for OCR: Tesseract installed on the system
-  macOS: brew install tesseract
-  Ubuntu: sudo apt install tesseract-ocr
+Requires Tesseract for OCR:
+  macOS:   brew install tesseract
+  Ubuntu:  sudo apt install tesseract-ocr
 """
 
 import sys
@@ -47,26 +46,26 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ── Configuration ──────────────────────────────────────────────────────────────
 
-BASE_DIR        = Path(__file__).resolve().parent
-DATA_DIR        = BASE_DIR / "GM 2022 - External Folder"
-CHROMA_DIR      = get_chroma_persist_dir()
-COLLECTION      = "gm_meetings"
-EMBED_MODEL     = "sentence-transformers/all-MiniLM-L6-v2"
+BASE_DIR    = Path(__file__).resolve().parent
+DATA_DIR    = BASE_DIR / "GM 2022 - External Folder"
+CHROMA_DIR  = get_chroma_persist_dir()
+COLLECTION  = "gm_meetings"
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
-PPT_MAX_CHARS   = 2000
-TEXT_CHUNK_SIZE = 1000
-TEXT_CHUNK_OVL  = 200
+# Chunk sizing — ~400 tokens at 4 chars/token → 1600 chars; 80-token overlap → 320 chars
+CHUNK_SIZE    = 1600
+CHUNK_OVERLAP = 320
 
+# Chart detection: pages with fewer chars + embedded images + keyword → OCR candidate
 CHART_TEXT_THRESHOLD = 200
 
-OCR_DPI         = 300
-# Tesseract: OEM 3 = default LSTM; PSM 6 = uniform text block (works well on slides)
-TESSERACT_CONFIG = "--oem 3 --psm 6"
+OCR_DPI          = 300
+TESSERACT_CONFIG = "--oem 3 --psm 6"  # OEM 3 = LSTM; PSM 6 = uniform text block (good for slides)
 
-VISION_MODEL    = "meta-llama/llama-4-scout-17b-16e-instruct"
-VISION_DPI      = 200
+VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+VISION_DPI   = 200
 
 CHART_KEYWORDS = (
     "per institute", "round robin", "certificate origin",
@@ -102,6 +101,8 @@ ChartMode = Literal["none", "local", "groq"]
 _groq_client = None
 
 
+# ── CLI ────────────────────────────────────────────────────────────────────────
+
 def parse_cli() -> tuple[bool, ChartMode, float]:
     argv = set(sys.argv[1:])
     force = "--rebuild" in argv
@@ -118,6 +119,8 @@ def parse_cli() -> tuple[bool, ChartMode, float]:
     return force, mode, delay
 
 
+# ── OCR helpers ────────────────────────────────────────────────────────────────
+
 def _tesseract_available() -> bool:
     try:
         import pytesseract
@@ -128,22 +131,18 @@ def _tesseract_available() -> bool:
 
 
 def extract_chart_data_local_ocr(page: fitz.Page) -> Optional[str]:
-    """Render page and OCR with local Tesseract — no network, no API quota."""
+    """Render slide page and OCR with local Tesseract — no API quota."""
     try:
         import pytesseract
     except ImportError:
         print("         !! pytesseract not installed: pip install pytesseract")
         return None
-
     try:
         pix = page.get_pixmap(dpi=OCR_DPI)
         img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
         img = ImageEnhance.Contrast(img).enhance(1.35)
-        text = pytesseract.image_to_string(img, config=TESSERACT_CONFIG)
-        text = text.strip()
-        if len(text) < 15:
-            return None
-        return text
+        text = pytesseract.image_to_string(img, config=TESSERACT_CONFIG).strip()
+        return text if len(text) >= 15 else None
     except Exception as exc:
         print(f"         !! OCR failed: {exc}")
         return None
@@ -162,7 +161,7 @@ def get_groq_client():
 
 
 def extract_chart_data_groq(page: fitz.Page) -> Optional[str]:
-    """Optional cloud vision — may hit rate limits on large corpora."""
+    """Optional cloud vision fallback via Groq — rate-limited."""
     try:
         pix = page.get_pixmap(dpi=VISION_DPI)
         img_b64 = base64.b64encode(pix.tobytes("png")).decode()
@@ -174,7 +173,7 @@ def extract_chart_data_groq(page: fitz.Page) -> Optional[str]:
                 "content": [
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
                     {"type": "text", "text": VISION_PROMPT},
-                ]
+                ],
             }],
             temperature=0.1,
             max_tokens=2000,
@@ -185,44 +184,33 @@ def extract_chart_data_groq(page: fitz.Page) -> Optional[str]:
         return None
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Document helpers ───────────────────────────────────────────────────────────
 
 def is_ppt_pdf(filename: str) -> bool:
     return any(k in filename.lower() for k in PPT_KEYWORDS)
 
 
-def is_chart_page(text: str, page) -> bool:
+def is_chart_page(text: str, page: fitz.Page) -> bool:
+    """A page is a chart candidate when it has little text, has images, and matches keywords."""
     if len(text) >= CHART_TEXT_THRESHOLD:
         return False
-    images = page.get_images(full=True)
-    if not images:
+    if not page.get_images(full=True):
         return False
-    text_lower = text.lower()
-    return any(kw in text_lower for kw in CHART_KEYWORDS)
+    return any(kw in text.lower() for kw in CHART_KEYWORDS)
 
 
 def infer_doc_type(filename: str) -> str:
     f = filename.lower()
-    if "minutes" in f:
-        return "meeting_minutes"
-    if "ppt" in f or "presentation" in f or "annual" in f:
-        return "presentation"
-    if "finance" in f:
-        return "finance_report"
-    if "marketing" in f:
-        return "marketing_report"
-    if "quality" in f:
-        return "quality_report"
-    if "legal" in f or "green claims" in f or "directive" in f:
-        return "legal_document"
-    if "microfibre" in f:
-        return "technical_update"
-    if "quantis" in f:
-        return "sustainability_report"
-    if "jd" in f or "secretary" in f:
-        return "job_description"
-    if "schedule" in f or "speed meeting" in f:
-        return "schedule"
+    if "minutes"    in f:                       return "meeting_minutes"
+    if "ppt"        in f or "annual"    in f:   return "presentation"
+    if "finance"    in f:                       return "finance_report"
+    if "marketing"  in f:                       return "marketing_report"
+    if "quality"    in f:                       return "quality_report"
+    if "legal"      in f or "directive" in f:   return "legal_document"
+    if "microfibre" in f:                       return "technical_update"
+    if "quantis"    in f:                       return "sustainability_report"
+    if "jd"         in f or "secretary" in f:   return "job_description"
+    if "schedule"   in f or "speed meeting" in f: return "schedule"
     return "document"
 
 
@@ -246,11 +234,18 @@ def collect_pdfs() -> List[dict]:
     return records
 
 
+# ── Page loading + OCR enrichment ─────────────────────────────────────────────
+
 def load_and_enrich_documents(
     records: List[dict],
     chart_mode: ChartMode,
     groq_delay: float,
 ) -> List[Document]:
+    """
+    Load every PDF page as a LangChain Document and attach rich metadata.
+    For chart-heavy pages, OCR/vision text is stored in a SEPARATE field
+    so chunking can treat it independently.
+    """
     all_docs: List[Document] = []
     total = len(records)
     chart_pages = 0
@@ -258,10 +253,9 @@ def load_and_enrich_documents(
 
     if chart_mode == "local" and not _tesseract_available():
         print(
-            "\n  [WARN] Tesseract not found or not working. Chart OCR disabled.\n"
-            "         Install: macOS: brew install tesseract\n"
-            "                   Ubuntu: sudo apt install tesseract-ocr\n"
-            "         Or run with --no-chart-ocr, or --groq-vision if you have API quota.\n"
+            "\n  [WARN] Tesseract not found. Chart OCR disabled.\n"
+            "         macOS: brew install tesseract | Ubuntu: sudo apt install tesseract-ocr\n"
+            "         Or run with --no-chart-ocr / --groq-vision\n"
         )
         chart_mode = "none"
 
@@ -271,13 +265,12 @@ def load_and_enrich_documents(
     if chart_mode == "local":
         extract_fn = extract_chart_data_local_ocr
         label = "OCR"
-        data_tag = "OCR"
         print(f"      Chart enrichment: local Tesseract (dpi={OCR_DPI})\n")
     elif chart_mode == "groq":
         extract_fn = extract_chart_data_groq
         label = "Groq vision"
         data_tag = "vision"
-        print(f"      Chart enrichment: {label} (delay {groq_delay}s between pages)\n")
+        print(f"      Chart enrichment: {label} (delay {groq_delay}s)\n")
 
     for idx, rec in enumerate(records, 1):
         tag = "[PPT]" if rec["is_ppt"] else "     "
@@ -296,15 +289,18 @@ def load_and_enrich_documents(
             page_num = page_doc.metadata.get("page", 0)
             text = page_doc.page_content.strip()
 
-            page_doc.metadata.update({
-                "year":      rec["year"],
-                "location":  rec["location"],
-                "folder":    rec["folder"],
-                "filename":  rec["filename"],
-                "doc_type":  rec["doc_type"],
-                "is_ppt":    str(rec["is_ppt"]),
-                "source":    str(rec["path"]),
-            })
+            base_meta = {
+                "year":         rec["year"],
+                "location":     rec["location"],
+                "folder":       rec["folder"],
+                "filename":     rec["filename"],
+                "doc_type":     rec["doc_type"],
+                "is_ppt":       str(rec["is_ppt"]),
+                "source":       str(rec["path"]),
+                "has_chart_ocr": "False",
+                "chunk_type":   "text",
+            }
+            page_doc.metadata.update(base_meta)
 
             if extract_fn and page_num < len(fitz_doc):
                 fitz_page = fitz_doc[page_num]
@@ -315,63 +311,91 @@ def load_and_enrich_documents(
                         time.sleep(groq_delay)
                     if extracted:
                         enriched += 1
-                        page_doc.page_content = (
-                            f"{text}\n\n"
-                            f"[EXTRACTED CHART DATA ({data_tag}) — {rec['year']} {rec['location']}]\n"
-                            f"{extracted}"
-                        )
-                        page_doc.metadata["has_chart_ocr"] = "True"
                         print(f"         + {label}: pg {page_num + 1}")
-                    else:
-                        page_doc.metadata["has_chart_ocr"] = "False"
-                else:
-                    page_doc.metadata["has_chart_ocr"] = "False"
-            else:
-                page_doc.metadata["has_chart_ocr"] = "False"
+                        # Store OCR as a separate metadata field so chunking can split it cleanly
+                        page_doc.metadata["has_chart_ocr"] = "True"
+                        page_doc.metadata["ocr_text"] = (
+                            f"[EXTRACTED CHART DATA ({data_tag}) — "
+                            f"{rec['year']} {rec['location']}]\n{extracted}"
+                        )
 
             all_docs.append(page_doc)
 
         fitz_doc.close()
 
-    print(f"\n      Chart pages detected: {chart_pages}")
-    print(f"      Chart pages enriched: {enriched}")
+    print(f"\n      Chart pages detected : {chart_pages}")
+    print(f"      Chart pages enriched : {enriched}")
     return all_docs
 
 
+# ── Chunking ───────────────────────────────────────────────────────────────────
+
 def chunk_documents(docs: List[Document]) -> List[Document]:
+    """
+    Split every document through RecursiveCharacterTextSplitter.
+
+    For pages that have OCR data:
+      - Split the base page text as normal "text" chunks
+      - Split the OCR section independently as "ocr" chunks
+    This prevents large OCR blobs from being merged with unrelated text.
+    """
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=TEXT_CHUNK_SIZE,
-        chunk_overlap=TEXT_CHUNK_OVL,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
 
     chunks: List[Document] = []
-    kept_whole = 0
-    split_count = 0
+    text_chunk_count = 0
+    ocr_chunk_count = 0
+    skipped = 0
 
     for doc in docs:
-        text = doc.page_content.strip()
-        if not text:
-            continue
+        base_text = doc.page_content.strip()
+        meta = doc.metadata
+        has_ocr = meta.get("has_chart_ocr") == "True"
+        ocr_text = meta.pop("ocr_text", None)  # pull OCR out of metadata
 
-        has_ocr = doc.metadata.get("has_chart_ocr") == "True"
-        is_ppt = doc.metadata.get("is_ppt") == "True"
-
-        if has_ocr or is_ppt or len(text) <= PPT_MAX_CHARS:
-            chunks.append(Document(page_content=text, metadata=doc.metadata))
-            kept_whole += 1
-        else:
-            sub = splitter.split_documents([doc])
+        # ── Split base page text ───────────────────────────────────────────
+        if base_text:
+            text_meta = {**meta, "chunk_type": "text"}
+            sub = splitter.split_documents(
+                [Document(page_content=base_text, metadata=text_meta)]
+            )
             sub = [c for c in sub if c.page_content.strip()]
+            # Tag each chunk with its index for debugging
+            for i, c in enumerate(sub):
+                c.metadata["chunk_index"] = i
             chunks.extend(sub)
-            split_count += len(sub)
+            text_chunk_count += len(sub)
+        else:
+            skipped += 1
 
-    print(f"      Pages kept whole  : {kept_whole}")
-    print(f"      Pages split into  : {split_count} chunks")
+        # ── Split OCR section separately ───────────────────────────────────
+        if has_ocr and ocr_text:
+            ocr_meta = {**meta, "chunk_type": "ocr", "has_chart_ocr": "True"}
+            ocr_sub = splitter.split_documents(
+                [Document(page_content=ocr_text, metadata=ocr_meta)]
+            )
+            ocr_sub = [c for c in ocr_sub if c.page_content.strip()]
+            for i, c in enumerate(ocr_sub):
+                c.metadata["chunk_index"] = i
+            chunks.extend(ocr_sub)
+            ocr_chunk_count += len(ocr_sub)
+
+    print(f"      Text chunks  : {text_chunk_count}")
+    print(f"      OCR  chunks  : {ocr_chunk_count}")
+    print(f"      Skipped pages: {skipped} (empty text)")
     return chunks
 
 
-def ingest(force_rebuild: bool = False, chart_mode: ChartMode = "local", groq_delay: float = 2.5) -> None:
+# ── Ingest orchestration ───────────────────────────────────────────────────────
+
+def ingest(
+    force_rebuild: bool = False,
+    chart_mode: ChartMode = "local",
+    groq_delay: float = 2.5,
+) -> None:
     chroma_path = Path(CHROMA_DIR)
 
     if chroma_path.exists() and not force_rebuild:
@@ -382,29 +406,31 @@ def ingest(force_rebuild: bool = False, chart_mode: ChartMode = "local", groq_de
         return
 
     print("\n" + "=" * 64)
-    print("  GM Meetings RAG — Index Builder (v4)")
-    print("  Charts: local Tesseract OCR by default (no API limits)")
+    print("  GM Meetings RAG — Index Builder (v5 — Production Chunking)")
+    print(f"  Chunk size: {CHUNK_SIZE} chars | Overlap: {CHUNK_OVERLAP} chars")
     print("=" * 64)
 
     print("\n[1/4] Discovering PDF documents …")
     records = collect_pdfs()
     ppt_count = sum(1 for r in records if r["is_ppt"])
-    print(f"      Found {len(records)} PDFs  "
-          f"({ppt_count} PPT-slides, {len(records) - ppt_count} text docs)\n")
+    print(
+        f"      Found {len(records)} PDFs  "
+        f"({ppt_count} PPT-slides, {len(records) - ppt_count} text docs)\n"
+    )
 
     print("[2/4] Loading pages + chart enrichment …")
-    print(f"      Chart mode: {chart_mode}")
-    print(f"      Chart keywords + <{CHART_TEXT_THRESHOLD} chars + embedded images\n")
+    print(f"      Chart mode   : {chart_mode}")
+    print(f"      OCR trigger  : <{CHART_TEXT_THRESHOLD} chars + images + keywords\n")
     docs = load_and_enrich_documents(records, chart_mode, groq_delay)
     print(f"      Loaded {len(docs)} pages total.\n")
 
     print("[3/4] Chunking …")
     chunks = chunk_documents(docs)
-    print(f"\n      Total chunks: {len(chunks)}\n")
+    print(f"\n      Total chunks : {len(chunks)}\n")
 
     from collections import Counter
     year_counts = Counter(c.metadata["year"] for c in chunks)
-    ocr_chunks = sum(1 for c in chunks if c.metadata.get("has_chart_ocr") == "True")
+    ocr_chunks  = sum(1 for c in chunks if c.metadata.get("has_chart_ocr") == "True")
     for yr in sorted(year_counts):
         print(f"      {yr}: {year_counts[yr]} chunks")
     print(f"      OCR-enriched chunks: {ocr_chunks}\n")
