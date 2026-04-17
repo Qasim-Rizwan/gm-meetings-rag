@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 
+Trial 1.xlsx
 # Python
 __pycache__/
 *.py[cod]
