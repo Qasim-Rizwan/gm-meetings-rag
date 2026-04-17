@@ -138,6 +138,7 @@ class QueryContext:
     detected_years:     List[str] = field(default_factory=list)
     detected_doc_type:  Optional[str] = None
     intent:             str = "general"
+    structure_hint:     Optional[str] = None     # user-requested answer structure
 
 
 class QueryAnalyzer:
@@ -186,6 +187,9 @@ class QueryAnalyzer:
         # ── Multi-query expansion ─────────────────────────────────────────────
         expanded = self._expand(question, detected_years, intent)
 
+        # ── Structure hint ────────────────────────────────────────────────────
+        structure_hint = self._detect_structure(question)
+
         return QueryContext(
             original_question=question,
             rewritten_query=rewritten,
@@ -193,7 +197,58 @@ class QueryAnalyzer:
             detected_years=detected_years,
             detected_doc_type=detected_doc_type,
             intent=intent,
+            structure_hint=structure_hint,
         )
+
+    # ── Structure detection helpers ───────────────────────────────────────────
+
+    # Patterns that signal the user wants a specific layout in the answer
+    _STRUCT_EXPLICIT = re.compile(
+        r"(?:present|structure|format|organize|break.?down|split|divide|show)"
+        r".{0,30}(?:as|into|in)\s+(.{5,120})",
+        re.IGNORECASE,
+    )
+    # "section 1: X  section 2: Y" or "(1) X  (2) Y" or "1. X  2. Y"
+    _STRUCT_NUMBERED = re.compile(
+        r"(?:section\s*[1①]|part\s*[1①]|\(1\)|^1[\.\)])\s*[:\-]?\s*(.+?)"
+        r"(?:section\s*[2②]|part\s*[2②]|\(2\)|^2[\.\)])\s*[:\-]?\s*(.+)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    # "with two/three/four sections: ..."
+    _STRUCT_COUNT = re.compile(
+        r"(?:in|with|using)\s+(?:two|three|four|2|3|4)\s+"
+        r"(?:sections?|parts?|points?|categories|headings?)\s*:?\s*(.{0,200})",
+        re.IGNORECASE,
+    )
+    # catch-all: lines after keywords like "headings:", "sections:", "subsections:"
+    _STRUCT_HEADING = re.compile(
+        r"(?:headings?|sections?|subsections?|parts?)\s*:\s*(.{5,200})",
+        re.IGNORECASE,
+    )
+
+    def _detect_structure(self, question: str) -> Optional[str]:
+        """
+        Returns a short instruction string if the question requests a specific
+        answer structure, e.g. 'Present in two sections: (1) Roadmap (2) Feedback'.
+        Returns None if no explicit structure is found.
+        """
+        for pattern in (
+            self._STRUCT_NUMBERED,
+            self._STRUCT_COUNT,
+            self._STRUCT_EXPLICIT,
+            self._STRUCT_HEADING,
+        ):
+            m = pattern.search(question)
+            if m:
+                raw = " / ".join(g.strip() for g in m.groups() if g and g.strip())
+                if raw:
+                    return (
+                        f"STRUCTURE REQUIREMENT — the user explicitly requested this "
+                        f"answer layout: {raw}. "
+                        f"Structure your 'answer' field EXACTLY according to this. "
+                        f"Use clear section headers (e.g. '### Section Name') to separate each part."
+                    )
+        return None
 
     def _expand(
         self, question: str, years: List[str], intent: str
@@ -461,10 +516,35 @@ class ContextBuilder:
             return " [RELEVANT]"
         return " [MARGINAL]"
 
+    # Year → sort key so 2022 < 2023 < 2024 < 2025; unknown years sort last
+    _YEAR_SORT = {"2022": 0, "2023": 1, "2024": 2, "2025": 3}
+
+    @classmethod
+    def _tier(cls, score: float) -> int:
+        """Map reranker score to a numeric tier (0=HIGHLY RELEVANT … 2=MARGINAL)."""
+        if score >= 5.0:
+            return 0
+        if score >= 0.0:
+            return 1
+        return 2
+
     @classmethod
     def build(cls, scored_docs: List[Tuple[float, Document]]) -> str:
+        # Sort: primary = relevance tier (best first), secondary = year (oldest first),
+        # tertiary = page number (ascending).  This keeps chronological order WITHIN
+        # each relevance band so the LLM naturally writes in chronological order.
+        def sort_key(item: Tuple[float, Document]) -> Tuple[int, int, int]:
+            score, doc = item
+            m    = doc.metadata
+            tier = cls._tier(score)
+            yr   = cls._YEAR_SORT.get(str(m.get("year", "")), 99)
+            pg   = int(m.get("page", 0)) if str(m.get("page", "0")).isdigit() else 0
+            return (tier, yr, pg)
+
+        ordered = sorted(scored_docs, key=sort_key)
+
         parts: List[str] = []
-        for i, (score, doc) in enumerate(scored_docs, 1):
+        for i, (score, doc) in enumerate(ordered, 1):
             m         = doc.metadata
             ocr_tag   = " [CHART-OCR]" if m.get("has_chart_ocr") == "True" else ""
             rel_tag   = cls._relevance_tag(score)
@@ -509,9 +589,19 @@ covering 2022–2025 (Rome 2022, Budapest 2023, Alcoy 2024, Copenhagen 2025).
 - Be specific and thorough; avoid vague summaries.
 
 ━━ CHRONOLOGICAL ORDER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- When the answer spans multiple years, always present information in
-  chronological order (oldest year first: 2022 → 2023 → 2024 → 2025).
-- Clearly label each year transition (e.g. "In 2022 (Rome):", "In 2023 (Budapest):").
+- Context chunks are pre-sorted oldest-year-first within each relevance tier.
+- When the answer spans multiple years, YOU MUST present information in
+  strict chronological order (oldest year first: 2022 → 2023 → 2024 → 2025).
+- Clearly label EVERY year transition with its location:
+    "In 2022 (Rome):", "In 2023 (Budapest):", "In 2024 (Alcoy):", "In 2025 (Copenhagen):"
+- NEVER mix events from different years in the same sentence or paragraph.
+- If only one year is relevant, use that label once and do not skip it.
+
+━━ ANSWER STRUCTURE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- If the user's question specifies a particular structure (sections, headings,
+  numbered parts, etc.), you MUST honour it EXACTLY in the "answer" field.
+- Use markdown headings (### Heading) to delineate sections where requested.
+- If no structure is specified, use 2-4 well-organised chronological paragraphs.
 
 ━━ NUMERICAL / CHART DATA ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - Chunks tagged [CHART-OCR] contain machine-read chart/table data.
@@ -538,7 +628,7 @@ Context chunks tagged [MARGINAL] have weak relevance — use them only if
 Return ONLY a valid JSON object with EXACTLY these six keys:
 
 {{
-  "answer":         "<string — 2-4 paragraphs. Cite year+location per claim. Chronological. Synthesize specifics.>",
+  "answer":         "<string — strictly chronological (2022→2025). Each year labelled 'In YYYY (Location):'. Follow any structure explicitly requested by the user. Cite year+location per claim. Synthesize specifics — no vague summaries.>",
   "key_points":     ["<3-6 bullets starting with action verbs. Include concrete facts.>"],
   "relevant_years": ["<only years actually mentioned in your answer e.g. '2023'>"],
   "document_types": ["<distinct source doc types referenced>"],
@@ -550,7 +640,11 @@ Return ONLY a valid JSON object with EXACTLY these six keys:
 {context}
 """
 
-HUMAN_PROMPT = "Question: {question}"
+HUMAN_PROMPT = """\
+Question: {question}
+
+{structure_instruction}\
+"""
 
 _FALLBACK_RESPONSE = GMResponse(
     answer="Unable to generate a structured response. Please rephrase your question and try again.",
@@ -579,12 +673,24 @@ class Generator:
         ])
         self._chain = self.prompt | self.llm | StrOutputParser()
 
-    def generate(self, question: str, context: str) -> GMResponse:
+    def generate(
+        self,
+        question: str,
+        context: str,
+        structure_hint: Optional[str] = None,
+    ) -> GMResponse:
         import time as _time
+
+        # Include the structure hint (if any) in the user message
+        structure_instruction = structure_hint or ""
 
         for attempt in range(2):
             try:
-                raw = self._chain.invoke({"context": context, "question": question})
+                raw = self._chain.invoke({
+                    "context": context,
+                    "question": question,
+                    "structure_instruction": structure_instruction,
+                })
                 # Strip markdown code fences if present
                 raw = raw.strip()
                 if raw.startswith("```"):
@@ -730,7 +836,11 @@ class GMRagEngine:
 
         # ── Build context + generate ──────────────────────────────────────────
         context  = self.ctx_builder.build(scored_docs)
-        response = self.generator.generate(question, context)
+        response = self.generator.generate(
+            question,
+            context,
+            structure_hint=query_ctx.structure_hint,
+        )
         return response
 
     def query_with_filters(
