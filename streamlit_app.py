@@ -8,6 +8,12 @@ Streamlit Community Cloud:
   Main file: streamlit_app.py
   Secrets: GROQ_API_KEY (see secrets.toml.example / DEPLOYMENT.md)
   Commit `chroma_db/` (or set CHROMA_PERSIST_DIR) so the index exists at runtime.
+
+Dynamic behaviour:
+  - Year and document-type filters are populated from the live ChromaDB index,
+    so they update automatically when new meeting data is ingested.
+  - Use the "Refresh index" button in the sidebar after running
+    `python ingest.py --update` to reload without restarting the server.
 """
 
 from __future__ import annotations
@@ -72,16 +78,19 @@ def main() -> None:
         )
         st.stop()
 
-    from rag import YEARS
-
     engine = get_engine()
 
     with st.sidebar:
         st.header("Filters")
-        year_options = ["All years"] + list(YEARS)
+
+        # Year filter — populated from the live index so new meeting years
+        # appear automatically after an --update ingest.
+        live_years = engine.get_years()
+        year_options = ["All years"] + live_years
         year_choice = st.selectbox("Year", year_options, index=0)
         year_filter = None if year_choice == "All years" else year_choice
 
+        # Doc-type filter — populated from the live index as well.
         try:
             stats = engine.collection_stats()
             dtype_keys = sorted(stats.get("by_doc_type", {}).keys())
@@ -91,14 +100,29 @@ def main() -> None:
         doc_choice = st.selectbox("Document type", doc_options, index=0)
         doc_type_filter = None if doc_choice == "All types" else doc_choice
 
+        st.divider()
+
         if st.button("Show index stats"):
             try:
                 s = engine.collection_stats()
                 st.metric("Total chunks", s["total_chunks"])
                 st.metric("Chart-OCR chunks", s["chart_ocr_enriched"])
-                st.json({"by_year": s["by_year"], "by_doc_type": s["by_doc_type"]})
+                st.json({
+                    "by_year":        s["by_year"],
+                    "by_doc_type":    s["by_doc_type"],
+                    "year_locations": s.get("year_locations", {}),
+                })
             except Exception as e:
                 st.error(str(e))
+
+        st.divider()
+
+        st.caption("After ingesting new data with `python ingest.py --update`, "
+                   "click below to reload the index without restarting the server.")
+        if st.button("Refresh index", type="secondary"):
+            get_engine.clear()
+            st.success("Index cache cleared — reloading on next query.")
+            st.rerun()
 
     question = st.text_area(
         "Your question",

@@ -6,10 +6,13 @@ Secrets resolution order (matches Streamlit Cloud best practice):
 2. `os.environ` (including values from a local `.env` loaded below)
 
 Optional env / secrets:
-- CHROMA_PERSIST_DIR — absolute or repo-relative path to the persisted Chroma folder (default: ./chroma_db next to this file)
-- HF_OFFLINE — if "1" / "true", force Hugging Face hub offline mode (local air-gapped use).
- Omit on Streamlit Cloud so the embedding model can download on first cold start.
-- GROQ_VISION_DELAY — optional; used only by `ingest.py` with --groq-vision
+- CHROMA_PERSIST_DIR — absolute or repo-relative path to the persisted Chroma folder
+                       (default: ./chroma_db next to this file)
+- DATA_DIR           — path to the root folder containing all GM meeting year-folders
+                       (default: ./GM 2022 - External Folder next to this file)
+- HF_OFFLINE         — if "1" / "true", force Hugging Face hub offline mode (local air-gapped use).
+                       Omit on Streamlit Cloud so the embedding model can download on first cold start.
+- GROQ_VISION_DELAY  — optional; used only by `ingest.py` with --groq-vision
 """
 
 from __future__ import annotations
@@ -64,6 +67,21 @@ def get_chroma_persist_dir() -> str:
 def hf_offline_enabled() -> bool:
     v = get_secret("HF_OFFLINE")
     return str(v or "").lower() in ("1", "true", "yes")
+
+
+def get_data_dir() -> str:
+    """Root folder that contains all GM meeting year-sub-folders.
+
+    Override via DATA_DIR env/secret.  Default: ./GM 2022 - External Folder
+    (the original folder name kept for backward-compatibility).
+    """
+    override = get_secret("DATA_DIR")
+    if override:
+        p = Path(override).expanduser()
+        if not p.is_absolute():
+            p = (BASE_DIR / p).resolve()
+        return str(p)
+    return str(BASE_DIR / "GM 2022 - External Folder")
 
 
 def apply_hf_hub_env() -> None:

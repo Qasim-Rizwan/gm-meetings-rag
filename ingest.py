@@ -1,23 +1,26 @@
 """
-GM Meetings RAG — Ingestion Pipeline (v5 — Production Chunking)
-===============================================================
-Changes from v4:
-  - Chunk size reduced to ~400 tokens (1600 chars) with 80-token overlap
-  - ALL pages are always split — no more "keep whole" exceptions
-  - OCR text is split separately from base page text to avoid bloated chunks
-  - Each chunk produced from an OCR section carries has_chunk_type="ocr"
-  - Chunk index metadata added for debugging
+GM Meetings RAG — Ingestion Pipeline (v6 — Dynamic + Incremental)
+=================================================================
+Changes from v5:
+  - DATA_DIR is configurable via DATA_DIR env/secret
+  - Auto-discovers new GM meeting year-folders (no more hardcoded FOLDER_META)
+  - --update mode: adds only NEW files to an existing index (no full rebuild)
+  - --rebuild still supported for a clean full index
+  - FOLDER_META kept as an optional explicit override / fallback
 
 Run:
-    python ingest.py --rebuild              # Tesseract OCR on chart slides
+    python ingest.py --rebuild              # Full rebuild with Tesseract OCR
     python ingest.py --rebuild --no-chart-ocr
     python ingest.py --rebuild --groq-vision
+    python ingest.py --update               # Add only new PDFs to existing index
+    python ingest.py --update --no-chart-ocr
 
 Requires Tesseract for OCR:
   macOS:   brew install tesseract
   Ubuntu:  sudo apt install tesseract-ocr
 """
 
+import re
 import sys
 import time
 import io
@@ -34,7 +37,7 @@ warnings.filterwarnings("ignore")
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 logging.getLogger("pymupdf").setLevel(logging.ERROR)
 
-from env_config import apply_hf_hub_env, get_chroma_persist_dir, get_secret
+from env_config import apply_hf_hub_env, get_chroma_persist_dir, get_data_dir, get_secret
 
 apply_hf_hub_env()
 
@@ -49,7 +52,7 @@ from langchain_core.documents import Document
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 BASE_DIR    = Path(__file__).resolve().parent
-DATA_DIR    = BASE_DIR / "GM 2022 - External Folder"
+DATA_DIR    = Path(get_data_dir())   # overridable via DATA_DIR env/secret
 CHROMA_DIR  = get_chroma_persist_dir()
 COLLECTION  = "gm_meetings"
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -87,12 +90,91 @@ VISION_PROMPT = (
     "single number matters for analysis."
 )
 
-FOLDER_META = {
-    "GM 2022 - E":                      {"year": "2022", "location": "Rome"},
-    "GM Meeting 2023_external folder":  {"year": "2023", "location": "Budapest"},
-    "GM_Alcoy_24_external folder":      {"year": "2024", "location": "Alcoy"},
-    "GM_Copenhagen_25_external folder": {"year": "2025", "location": "Copenhagen"},
+# Explicit overrides — only needed when the folder name does not contain
+# a city/location keyword (e.g. "GM 2022 - E" has no city in its name).
+# Add new entries here only when auto-discovery cannot infer the location.
+FOLDER_META_OVERRIDES: dict[str, dict] = {
+    "GM 2022 - E": {"year": "2022", "location": "Rome"},
 }
+
+# Keywords used to infer meeting location from folder name
+_LOCATION_KEYWORDS: dict[str, str] = {
+    "rome":       "Rome",
+    "budapest":   "Budapest",
+    "alcoy":      "Alcoy",
+    "copenhagen": "Copenhagen",
+    "zurich":     "Zurich",
+    "paris":      "Paris",
+    "london":     "London",
+    "berlin":     "Berlin",
+    "madrid":     "Madrid",
+    "istanbul":   "Istanbul",
+    "vienna":     "Vienna",
+    "amsterdam":  "Amsterdam",
+}
+
+_YEAR4_RE = re.compile(r"\b(20\d{2})\b")
+_YEAR2_RE = re.compile(r"[_\-\s](\d{2})[_\-\s]")
+
+
+def discover_folder_meta(data_dir: Path) -> dict[str, dict]:
+    """
+    Scan *data_dir* for sub-directories and automatically extract year and
+    location from each folder name.
+
+    Resolution order for each folder:
+    1. Explicit entry in FOLDER_META_OVERRIDES  → used as-is.
+    2. 4-digit year found in name  (e.g. "2023")
+    3. 2-digit year flanked by separators (e.g. "_24_" → "2024"; range 20-40)
+    4. Location from _LOCATION_KEYWORDS matched against lower-cased name.
+
+    Folders that yield no year are silently skipped (they are probably not
+    GM meeting year-folders).
+    """
+    result: dict[str, dict] = {}
+
+    if not data_dir.exists():
+        print(f"  [WARN] DATA_DIR not found: {data_dir}")
+        return result
+
+    for folder in sorted(data_dir.iterdir()):
+        if not folder.is_dir():
+            continue
+        name = folder.name
+
+        # 1. Explicit override wins
+        if name in FOLDER_META_OVERRIDES:
+            result[name] = FOLDER_META_OVERRIDES[name]
+            continue
+
+        name_lower = name.lower()
+
+        # 2. Extract year
+        m4 = _YEAR4_RE.search(name)
+        if m4:
+            year = m4.group(1)
+        else:
+            m2 = _YEAR2_RE.search(name)
+            if m2:
+                y2 = int(m2.group(1))
+                year = f"20{y2:02d}" if 20 <= y2 <= 40 else None
+            else:
+                year = None
+
+        if not year:
+            continue  # not a GM year-folder
+
+        # 3. Extract location
+        location = "Unknown"
+        for kw, loc in _LOCATION_KEYWORDS.items():
+            if kw in name_lower:
+                location = loc
+                break
+
+        result[name] = {"year": year, "location": location}
+
+    return result
+
 
 PPT_KEYWORDS = ("ppt", "1_1 speed")
 
@@ -103,9 +185,14 @@ _groq_client = None
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
-def parse_cli() -> tuple[bool, ChartMode, float]:
+def parse_cli() -> tuple[bool, bool, ChartMode, float]:
+    """Returns (force_rebuild, update_mode, chart_mode, groq_delay)."""
     argv = set(sys.argv[1:])
-    force = "--rebuild" in argv
+    force  = "--rebuild" in argv
+    update = "--update"  in argv
+    if force and update:
+        print("[WARN] --rebuild and --update are mutually exclusive; using --rebuild.")
+        update = False
     try:
         delay = float(get_secret("GROQ_VISION_DELAY") or "2.5")
     except (TypeError, ValueError):
@@ -116,7 +203,7 @@ def parse_cli() -> tuple[bool, ChartMode, float]:
         mode = "groq"
     else:
         mode = "local"
-    return force, mode, delay
+    return force, update, mode, delay
 
 
 # ── OCR helpers ────────────────────────────────────────────────────────────────
@@ -214,14 +301,32 @@ def infer_doc_type(filename: str) -> str:
     return "document"
 
 
-def collect_pdfs() -> List[dict]:
+def collect_pdfs(exclude_sources: set[str] | None = None) -> List[dict]:
+    """
+    Discover all PDFs under DATA_DIR.
+
+    Parameters
+    ----------
+    exclude_sources:
+        Set of already-indexed source paths (str).  When provided, PDFs whose
+        resolved path is in this set are skipped — used by --update mode.
+    """
+    folder_meta = discover_folder_meta(DATA_DIR)
+    if not folder_meta:
+        print(f"  [WARN] No GM meeting folders found under: {DATA_DIR}")
+        return []
+
     records = []
-    for folder_name, meta in FOLDER_META.items():
+    exclude = exclude_sources or set()
+
+    for folder_name, meta in folder_meta.items():
         folder_path = DATA_DIR / folder_name
         if not folder_path.exists():
             print(f"  [WARN] Folder not found: {folder_path}")
             continue
         for pdf_path in sorted(folder_path.rglob("*.pdf")):
+            if str(pdf_path) in exclude:
+                continue
             records.append({
                 "path":     pdf_path,
                 "year":     meta["year"],
@@ -391,27 +496,50 @@ def chunk_documents(docs: List[Document]) -> List[Document]:
 
 # ── Ingest orchestration ───────────────────────────────────────────────────────
 
+def _build_embeddings() -> HuggingFaceEmbeddings:
+    return HuggingFaceEmbeddings(
+        model_name=EMBED_MODEL,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+
+def _print_chunk_summary(chunks: List[Document]) -> None:
+    from collections import Counter
+    year_counts = Counter(c.metadata["year"] for c in chunks)
+    ocr_chunks  = sum(1 for c in chunks if c.metadata.get("has_chart_ocr") == "True")
+    for yr in sorted(year_counts):
+        print(f"      {yr}: {year_counts[yr]} chunks")
+    print(f"      OCR-enriched chunks: {ocr_chunks}\n")
+
+
 def ingest(
     force_rebuild: bool = False,
     chart_mode: ChartMode = "local",
     groq_delay: float = 2.5,
 ) -> None:
+    """Full (re)build of the ChromaDB index from all PDFs in DATA_DIR."""
     chroma_path = Path(CHROMA_DIR)
 
     if chroma_path.exists() and not force_rebuild:
         print(
             f"\n[INFO] ChromaDB already exists at '{CHROMA_DIR}'.\n"
             "       Pass --rebuild to force a fresh index.\n"
+            "       Pass --update  to add only new PDFs.\n"
         )
         return
 
     print("\n" + "=" * 64)
-    print("  GM Meetings RAG — Index Builder (v5 — Production Chunking)")
+    print("  GM Meetings RAG — Index Builder (v6 — Dynamic)")
+    print(f"  DATA_DIR  : {DATA_DIR}")
     print(f"  Chunk size: {CHUNK_SIZE} chars | Overlap: {CHUNK_OVERLAP} chars")
     print("=" * 64)
 
     print("\n[1/4] Discovering PDF documents …")
     records = collect_pdfs()
+    if not records:
+        print("  [ERROR] No PDFs found. Check DATA_DIR path.\n")
+        return
     ppt_count = sum(1 for r in records if r["is_ppt"])
     print(
         f"      Found {len(records)} PDFs  "
@@ -427,23 +555,13 @@ def ingest(
     print("[3/4] Chunking …")
     chunks = chunk_documents(docs)
     print(f"\n      Total chunks : {len(chunks)}\n")
-
-    from collections import Counter
-    year_counts = Counter(c.metadata["year"] for c in chunks)
-    ocr_chunks  = sum(1 for c in chunks if c.metadata.get("has_chart_ocr") == "True")
-    for yr in sorted(year_counts):
-        print(f"      {yr}: {year_counts[yr]} chunks")
-    print(f"      OCR-enriched chunks: {ocr_chunks}\n")
+    _print_chunk_summary(chunks)
 
     print("[4/4] Embedding + persisting to ChromaDB …")
     print(f"      Model     : {EMBED_MODEL}")
     print(f"      Directory : {CHROMA_DIR}\n")
 
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBED_MODEL,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
+    embeddings = _build_embeddings()
 
     if chroma_path.exists() and force_rebuild:
         import shutil
@@ -464,6 +582,80 @@ def ingest(
     print(f"       Persisted to: {CHROMA_DIR}\n")
 
 
+def ingest_update(
+    chart_mode: ChartMode = "local",
+    groq_delay: float = 2.5,
+) -> None:
+    """
+    Incremental update — add only NEW PDFs to an existing index.
+
+    - Connects to the existing ChromaDB collection.
+    - Reads all already-indexed source paths from metadata.
+    - Discovers all PDFs under DATA_DIR and skips known ones.
+    - Processes only the new files and appends them to the collection.
+
+    If no index exists yet, falls back to a full build automatically.
+    """
+    chroma_path = Path(CHROMA_DIR)
+    if not chroma_path.exists():
+        print("[INFO] No existing index found — running full build instead.\n")
+        ingest(force_rebuild=False, chart_mode=chart_mode, groq_delay=groq_delay)
+        return
+
+    print("\n" + "=" * 64)
+    print("  GM Meetings RAG — Incremental Update (v6)")
+    print(f"  DATA_DIR  : {DATA_DIR}")
+    print("=" * 64)
+
+    print("\n[1/5] Loading existing index to check indexed sources …")
+    embeddings = _build_embeddings()
+    vectorstore = Chroma(
+        collection_name=COLLECTION,
+        embedding_function=embeddings,
+        persist_directory=CHROMA_DIR,
+    )
+    col   = vectorstore._collection
+    count = col.count()
+    meta  = col.get(limit=count, include=["metadatas"])["metadatas"] if count else []
+    existing_sources = {m.get("source", "") for m in meta}
+    print(f"      Existing index has {count} chunks from {len(existing_sources)} source paths.")
+
+    print("\n[2/5] Discovering all PDFs …")
+    all_records  = collect_pdfs()
+    new_records  = collect_pdfs(exclude_sources=existing_sources)
+    skipped      = len(all_records) - len(new_records)
+    print(f"      Total PDFs found : {len(all_records)}")
+    print(f"      Already indexed  : {skipped}")
+    print(f"      New PDFs to add  : {len(new_records)}\n")
+
+    if not new_records:
+        print("[DONE] Index is already up to date — nothing to add.\n")
+        return
+
+    print("[3/5] Loading pages + chart enrichment …")
+    print(f"      Chart mode   : {chart_mode}")
+    print(f"      OCR trigger  : <{CHART_TEXT_THRESHOLD} chars + images + keywords\n")
+    docs = load_and_enrich_documents(new_records, chart_mode, groq_delay)
+    print(f"      Loaded {len(docs)} pages total.\n")
+
+    print("[4/5] Chunking …")
+    chunks = chunk_documents(docs)
+    print(f"\n      New chunks : {len(chunks)}\n")
+    _print_chunk_summary(chunks)
+
+    print("[5/5] Embedding + appending to ChromaDB …")
+    t0 = time.time()
+    vectorstore.add_documents(chunks)
+    elapsed = time.time() - t0
+
+    print(f"\n[DONE] Update complete in {elapsed:.1f}s")
+    print(f"       '{COLLECTION}' now holds {vectorstore._collection.count()} vectors.")
+    print(f"       Persisted to: {CHROMA_DIR}\n")
+
+
 if __name__ == "__main__":
-    force, mode, delay = parse_cli()
-    ingest(force_rebuild=force, chart_mode=mode, groq_delay=delay)
+    force, update, mode, delay = parse_cli()
+    if update:
+        ingest_update(chart_mode=mode, groq_delay=delay)
+    else:
+        ingest(force_rebuild=force, chart_mode=mode, groq_delay=delay)

@@ -58,6 +58,9 @@ GROQ_MODEL     = "llama-3.3-70b-versatile"
 # BAAI/bge-reranker-base for ~10% accuracy gain at ~2× cost.
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
+# Fallback constants used before a live ChromaDB index is available.
+# The engine populates self.years / self.year_locations at init time from the
+# actual collection, so these stay correct even as new meeting years are added.
 YEARS          = ["2022", "2023", "2024", "2025"]
 YEAR_LOCATIONS = {"2022": "Rome", "2023": "Budapest", "2024": "Alcoy", "2025": "Copenhagen"}
 
@@ -148,17 +151,28 @@ class QueryAnalyzer:
       - doc_type hint
     Then rewrites the query for better retrieval and optionally generates
     expanded query variants for multi-query retrieval.
+
+    year_locations: mapping of year → location name, used to recognise
+    city names in queries (e.g. "Budapest" → 2023).  When None, falls back
+    to the module-level YEAR_LOCATIONS constant.  Pass the live index values
+    so new meeting cities are automatically recognised.
     """
 
-    _YEAR_RE    = re.compile(r"\b(202[2-5])\b")
-    _YEAR_WORDS = {"rome": "2022", "budapest": "2023", "alcoy": "2024", "copenhagen": "2025"}
+    _YEAR_RE = re.compile(r"\b(20\d{2})\b")   # matches any 20xx year
+
+    def __init__(self, year_locations: Optional[dict] = None) -> None:
+        yl = year_locations or YEAR_LOCATIONS
+        # Build city → year lookup (lower-cased city key)
+        self._year_words: dict[str, str] = {
+            loc.lower(): yr for yr, loc in yl.items()
+        }
 
     def analyze(self, question: str) -> QueryContext:
         q_lower = question.lower()
 
         # ── Year detection ────────────────────────────────────────────────────
         years: List[str] = self._YEAR_RE.findall(question)
-        for loc_word, yr in self._YEAR_WORDS.items():
+        for loc_word, yr in self._year_words.items():
             if loc_word in q_lower and yr not in years:
                 years.append(yr)
         # Stable deduplicate
@@ -651,8 +665,13 @@ class GMRagEngine:
             persist_directory=CHROMA_DIR,
         )
 
+        # Derive years/locations dynamically from what is actually in the index.
+        # Falls back gracefully to the module-level constants when the collection
+        # is empty (first run before rebuild).
+        self.years, self.year_locations = self._derive_years_from_index()
+
         print("[RAG] Building hybrid retriever (dense + BM25) …")
-        self.query_analyzer = QueryAnalyzer()
+        self.query_analyzer = QueryAnalyzer(year_locations=self.year_locations)
         self.retriever      = HybridRetriever(self.vectorstore)
 
         print("[RAG] Loading cross-encoder reranker …")
@@ -679,6 +698,44 @@ class GMRagEngine:
         )
         self.generator = Generator(llm)
         print("[RAG] Ready.\n")
+
+    # ── Internal helpers ───────────────────────────────────────────────────────
+
+    def _derive_years_from_index(self) -> tuple[List[str], dict]:
+        """
+        Read unique year + location pairs from ChromaDB metadata.
+
+        Returns (sorted_years_list, year_to_location_dict).
+        Falls back to module-level constants if the collection is empty.
+        """
+        try:
+            col   = self.vectorstore._collection
+            count = col.count()
+            if count == 0:
+                return list(YEARS), dict(YEAR_LOCATIONS)
+            meta  = col.get(limit=count, include=["metadatas"])["metadatas"]
+            pairs: dict[str, str] = {}
+            for m in meta:
+                yr  = m.get("year")
+                loc = m.get("location")
+                if yr and loc and yr not in pairs:
+                    pairs[yr] = loc
+            if not pairs:
+                return list(YEARS), dict(YEAR_LOCATIONS)
+            years_sorted = sorted(pairs.keys())
+            logger.info(f"[Engine] Index years: {years_sorted}")
+            return years_sorted, pairs
+        except Exception as exc:
+            logger.warning(f"[Engine] Could not derive years from index: {exc}. Using fallback.")
+            return list(YEARS), dict(YEAR_LOCATIONS)
+
+    def get_years(self) -> List[str]:
+        """Return the sorted list of meeting years present in the current index."""
+        return self.years
+
+    def get_year_locations(self) -> dict:
+        """Return year → location mapping derived from the current index."""
+        return self.year_locations
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -743,8 +800,9 @@ class GMRagEngine:
         return self.query(question, year_filter=year, doc_type_filter=doc_type)
 
     def query_year(self, question: str, year: str) -> GMResponse:
-        if year not in YEARS:
-            raise ValueError(f"year must be one of {YEARS}")
+        live_years = self.get_years()
+        if year not in live_years:
+            raise ValueError(f"year must be one of {live_years}")
         return self.query(question, year_filter=year)
 
     def collection_stats(self) -> dict:
@@ -760,6 +818,7 @@ class GMRagEngine:
             "chart_ocr_enriched": ocr,
             "by_year":            dict(sorted(years.items())),
             "by_doc_type":        dict(sorted(dtypes.items())),
+            "year_locations":     self.year_locations,
         }
 
 
@@ -835,14 +894,15 @@ def run_cli(engine: GMRagEngine) -> None:
             continue
         if low.startswith("year "):
             arg = raw[5:].strip()
+            live_years = engine.get_years()
             if arg.lower() == "clear":
                 year_filter = None
                 print("  Year filter cleared.\n")
-            elif arg in YEARS:
+            elif arg in live_years:
                 year_filter = arg
                 print(f"  Year filter → {year_filter}\n")
             else:
-                print(f"  Unknown year '{arg}'. Choose from {YEARS} or 'clear'.\n")
+                print(f"  Unknown year '{arg}'. Choose from {live_years} or 'clear'.\n")
             continue
 
         print("  Thinking …\n")
