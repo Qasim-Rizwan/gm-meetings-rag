@@ -464,6 +464,71 @@ def ingest(
     print(f"       Persisted to: {CHROMA_DIR}\n")
 
 
+def ingest_uploaded_file(
+    file_path: str,
+    year: str,
+    location: str,
+    doc_type: Optional[str] = None,
+    chart_mode: ChartMode = "none",
+) -> int:
+    """
+    Ingest a single PDF into the EXISTING ChromaDB collection without a full rebuild.
+    Returns the number of chunks successfully added.
+
+    Called from the Streamlit admin portal when an admin uploads a new document.
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    filename = path.name
+    resolved_doc_type = doc_type or infer_doc_type(filename)
+
+    record: dict = {
+        "path":     path,
+        "year":     year,
+        "location": location,
+        "folder":   "admin_upload",
+        "filename": filename,
+        "doc_type": resolved_doc_type,
+        "is_ppt":   is_ppt_pdf(filename),
+    }
+
+    docs   = load_and_enrich_documents([record], chart_mode=chart_mode, groq_delay=2.5)
+    if not docs:
+        return 0
+
+    chunks = chunk_documents(docs)
+    if not chunks:
+        return 0
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBED_MODEL,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+    chroma_path = Path(CHROMA_DIR)
+    if chroma_path.exists():
+        # Append to existing collection
+        vectorstore = Chroma(
+            collection_name=COLLECTION,
+            embedding_function=embeddings,
+            persist_directory=CHROMA_DIR,
+        )
+        vectorstore.add_documents(chunks)
+    else:
+        # Collection does not exist yet — create it
+        Chroma.from_documents(
+            documents=chunks,
+            embedding=embeddings,
+            collection_name=COLLECTION,
+            persist_directory=CHROMA_DIR,
+        )
+
+    return len(chunks)
+
+
 if __name__ == "__main__":
     force, mode, delay = parse_cli()
     ingest(force_rebuild=force, chart_mode=mode, groq_delay=delay)

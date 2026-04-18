@@ -13,12 +13,11 @@ venv/
 *.egg-info/
 dist/
 build/
-prompt.txt
 # OS / editor
 .DS_Store
 .idea/
 .vscode/
-
+chroma_db/
 # Streamlit local secrets (Cloud uses dashboard instead)
 .streamlit/secrets.toml
 

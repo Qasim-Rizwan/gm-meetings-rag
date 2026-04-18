@@ -48,11 +48,12 @@ from langchain_core.output_parsers import StrOutputParser
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-BASE_DIR       = Path(__file__).resolve().parent
-CHROMA_DIR     = get_chroma_persist_dir()
-COLLECTION     = "gm_meetings"
-EMBED_MODEL    = "sentence-transformers/all-MiniLM-L6-v2"
-GROQ_MODEL     = "llama-3.3-70b-versatile"
+BASE_DIR            = Path(__file__).resolve().parent
+CHROMA_DIR          = get_chroma_persist_dir()
+COLLECTION          = "gm_meetings"
+EMBED_MODEL         = "sentence-transformers/all-MiniLM-L6-v2"
+GROQ_MODEL          = "llama-3.3-70b-versatile"
+CUSTOM_PROMPT_FILE  = BASE_DIR / "custom_prompt.txt"   # written by admin portal
 
 # Cross-encoder: ms-marco-MiniLM-L-6-v2 is fast (6-layer); swap to
 # BAAI/bge-reranker-base for ~10% accuracy gain at ~2× cost.
@@ -656,6 +657,29 @@ _FALLBACK_RESPONSE = GMResponse(
 )
 
 
+# ── Prompt helpers (used by admin portal) ──────────────────────────────────────
+
+def get_system_prompt() -> str:
+    """Return the active system prompt.  Admin-saved custom prompt takes priority."""
+    if CUSTOM_PROMPT_FILE.exists():
+        try:
+            return CUSTOM_PROMPT_FILE.read_text(encoding="utf-8")
+        except Exception:
+            pass
+    return SYSTEM_PROMPT
+
+
+def save_system_prompt(prompt: str) -> None:
+    """Persist a custom system prompt to disk."""
+    CUSTOM_PROMPT_FILE.write_text(prompt.strip(), encoding="utf-8")
+
+
+def reset_system_prompt() -> None:
+    """Delete the custom prompt file so the built-in default is used again."""
+    if CUSTOM_PROMPT_FILE.exists():
+        CUSTOM_PROMPT_FILE.unlink()
+
+
 # ── Generator ──────────────────────────────────────────────────────────────────
 
 class Generator:
@@ -668,7 +692,7 @@ class Generator:
     def __init__(self, llm: ChatGroq) -> None:
         self.llm    = llm
         self.prompt = ChatPromptTemplate.from_messages([
-            ("system", SYSTEM_PROMPT),
+            ("system", get_system_prompt()),   # respects admin-saved custom prompt
             ("human",  HUMAN_PROMPT),
         ])
         self._chain = self.prompt | self.llm | StrOutputParser()
