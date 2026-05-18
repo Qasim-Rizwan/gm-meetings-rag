@@ -90,7 +90,7 @@ class GMResponse(BaseModel):
         description="Distinct source document types referenced."
     )
     sources: List[str] = Field(
-        description="Unique filenames used to form the answer (no paths, no duplicates)."
+        description="Unique filename + page citations from retrieved chunks (no paths)."
     )
     confidence: Literal["high", "medium", "low"] = Field(
         description=(
@@ -561,6 +561,36 @@ class ContextBuilder:
         return "\n\n---\n\n".join(parts)
 
 
+def sources_from_scored_docs(scored_docs: List[Tuple[float, Document]]) -> List[str]:
+    """Citations from reranked chunks: filename and 1-based PDF page (PyMuPDF is 0-based)."""
+    seen: set = set()
+    sources: List[str] = []
+    for _score, doc in scored_docs:
+        m = doc.metadata
+        filename = m.get("filename") or "?"
+        if filename == "?" and m.get("source"):
+            filename = Path(str(m["source"])).name
+        page_raw = m.get("page")
+        if page_raw is None:
+            page_key: object = None
+            page_label = None
+        elif str(page_raw).isdigit():
+            page_key = int(page_raw)
+            page_label = str(page_key + 1)
+        else:
+            page_key = str(page_raw)
+            page_label = str(page_raw)
+        key = (filename, page_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        if page_label is None:
+            sources.append(filename)
+        else:
+            sources.append(f"{filename} — p. {page_label}")
+    return sources
+
+
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
@@ -865,6 +895,7 @@ class GMRagEngine:
             context,
             structure_hint=query_ctx.structure_hint,
         )
+        response.sources = sources_from_scored_docs(scored_docs)
         return response
 
     def query_with_filters(
