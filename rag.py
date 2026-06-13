@@ -1,19 +1,4 @@
-"""
-GM Meetings RAG — Production-Grade Query Engine (v2)
-====================================================
-Architecture:
-  QueryAnalyzer  →  HybridRetriever (Dense + BM25 + RRF + MultiQuery)
-  →  CrossEncoder Reranker  →  ContextBuilder  →  Groq Llama  →  GMResponse
 
-Usage (CLI):
-    python rag.py
-
-Usage (module):
-    from rag import GMRagEngine
-    engine = GMRagEngine()
-    result = engine.query("What were the key decisions in 2023?")
-    result = engine.query_with_filters("quality failures", year="2024")
-"""
 
 import re
 import sys
@@ -143,14 +128,7 @@ class QueryContext:
 
 
 class QueryAnalyzer:
-    """
-    Extracts metadata signals from the raw question:
-      - year detection (numeric + location name)
-      - intent classification
-      - doc_type hint
-    Then rewrites the query for better retrieval and optionally generates
-    expanded query variants for multi-query retrieval.
-    """
+    
 
     _YEAR_RE    = re.compile(r"\b(202[2-5])\b")
     _YEAR_WORDS = {"rome": "2022", "budapest": "2023", "alcoy": "2024", "copenhagen": "2025"}
@@ -228,11 +206,7 @@ class QueryAnalyzer:
     )
 
     def _detect_structure(self, question: str) -> Optional[str]:
-        """
-        Returns a short instruction string if the question requests a specific
-        answer structure, e.g. 'Present in two sections: (1) Roadmap (2) Feedback'.
-        Returns None if no explicit structure is found.
-        """
+        
         for pattern in (
             self._STRUCT_NUMBERED,
             self._STRUCT_COUNT,
@@ -269,13 +243,7 @@ class QueryAnalyzer:
 # ── Hybrid Retriever ───────────────────────────────────────────────────────────
 
 class HybridRetriever:
-    """
-    Two-stage hybrid retrieval:
-      1. Dense search   — ChromaDB cosine similarity (with metadata filter)
-      2. Sparse search  — BM25Okapi over all indexed chunks (with same filter)
-    Then merge both ranked lists via Reciprocal Rank Fusion (RRF).
-    Supports multi-query: queries from expanded_queries are also searched and fused.
-    """
+    
 
     def __init__(self, vectorstore: Chroma) -> None:
         self.vectorstore = vectorstore
@@ -453,13 +421,7 @@ class HybridRetriever:
 # ── Cross-Encoder Reranker ─────────────────────────────────────────────────────
 
 class Reranker:
-    """
-    Scores every (question, chunk) pair with a cross-encoder and returns
-    only the top-n most relevant chunks.
-
-    Default model: cross-encoder/ms-marco-MiniLM-L-6-v2 (fast, 6-layer).
-    For higher accuracy: BAAI/bge-reranker-base (~2× slower, ~+8% MRR).
-    """
+   
 
     def __init__(self, model_name: str = RERANKER_MODEL) -> None:
         self.model = None
@@ -713,11 +675,7 @@ def reset_system_prompt() -> None:
 # ── Generator ──────────────────────────────────────────────────────────────────
 
 class Generator:
-    """
-    Invokes Groq Llama in JSON mode (response_format=json_object) and parses
-    the response manually — avoids the verbose schema instructions that confuse
-    the LLM when using JsonOutputParser(pydantic_object=...).
-    """
+    
 
     def __init__(self, llm: ChatGroq) -> None:
         self.llm    = llm
@@ -766,23 +724,7 @@ class Generator:
 # ── Main Engine ────────────────────────────────────────────────────────────────
 
 class GMRagEngine:
-    """
-    Production-grade RAG engine.
-
-    Full pipeline:
-      QueryAnalyzer
-        → HybridRetriever  (Dense ChromaDB + BM25 + RRF + multi-query expansion)
-        → CrossEncoder Reranker
-        → ContextBuilder
-        → Groq Llama Generator
-        → GMResponse
-
-    Public API:
-      engine.query(question)
-      engine.query_with_filters(question, year, doc_type)
-      engine.query_year(question, year)
-      engine.collection_stats()
-    """
+    
 
     def __init__(self) -> None:
         self._check_index()

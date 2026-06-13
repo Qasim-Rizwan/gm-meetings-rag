@@ -1,22 +1,3 @@
-"""
-GM Meetings RAG — Ingestion Pipeline (v5 — Production Chunking)
-===============================================================
-Changes from v4:
-  - Chunk size reduced to ~400 tokens (1600 chars) with 80-token overlap
-  - ALL pages are always split — no more "keep whole" exceptions
-  - OCR text is split separately from base page text to avoid bloated chunks
-  - Each chunk produced from an OCR section carries has_chunk_type="ocr"
-  - Chunk index metadata added for debugging
-
-Run:
-    python ingest.py --rebuild              # Tesseract OCR on chart slides
-    python ingest.py --rebuild --no-chart-ocr
-    python ingest.py --rebuild --groq-vision
-
-Requires Tesseract for OCR:
-  macOS:   brew install tesseract
-  Ubuntu:  sudo apt install tesseract-ocr
-"""
 
 import sys
 import time
@@ -241,11 +222,7 @@ def load_and_enrich_documents(
     chart_mode: ChartMode,
     groq_delay: float,
 ) -> List[Document]:
-    """
-    Load every PDF page as a LangChain Document and attach rich metadata.
-    For chart-heavy pages, OCR/vision text is stored in a SEPARATE field
-    so chunking can treat it independently.
-    """
+    
     all_docs: List[Document] = []
     total = len(records)
     chart_pages = 0
@@ -331,14 +308,7 @@ def load_and_enrich_documents(
 # ── Chunking ───────────────────────────────────────────────────────────────────
 
 def chunk_documents(docs: List[Document]) -> List[Document]:
-    """
-    Split every document through RecursiveCharacterTextSplitter.
-
-    For pages that have OCR data:
-      - Split the base page text as normal "text" chunks
-      - Split the OCR section independently as "ocr" chunks
-    This prevents large OCR blobs from being merged with unrelated text.
-    """
+   
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -471,12 +441,7 @@ def ingest_uploaded_file(
     doc_type: Optional[str] = None,
     chart_mode: ChartMode = "none",
 ) -> int:
-    """
-    Ingest a single PDF into the EXISTING ChromaDB collection without a full rebuild.
-    Returns the number of chunks successfully added.
-
-    Called from the Streamlit admin portal when an admin uploads a new document.
-    """
+    
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {file_path}")

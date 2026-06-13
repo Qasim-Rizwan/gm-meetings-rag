@@ -1,10 +1,4 @@
-"""
-Polished visual theme for the Streamlit multi-page RAG app.
 
-Injected via unsafe_allow_html CSS — safe here because the stylesheet is static
-(no user input).  Call apply_theme() once per page, immediately after
-st.set_page_config().
-"""
 
 from __future__ import annotations
 

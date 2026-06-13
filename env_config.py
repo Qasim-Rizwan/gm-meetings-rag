@@ -1,16 +1,4 @@
-"""
-Shared configuration for CLI ingest, `rag.py`, and Streamlit.
 
-Secrets resolution order (matches Streamlit Cloud best practice):
-1. `st.secrets["KEY"]` when the app runs inside Streamlit and the key exists
-2. `os.environ` (including values from a local `.env` loaded below)
-
-Optional env / secrets:
-- CHROMA_PERSIST_DIR — absolute or repo-relative path to the persisted Chroma folder (default: ./chroma_db next to this file)
-- HF_OFFLINE — if "1" / "true", force Hugging Face hub offline mode (local air-gapped use).
- Omit on Streamlit Cloud so the embedding model can download on first cold start.
-- GROQ_VISION_DELAY — optional; used only by `ingest.py` with --groq-vision
-"""
 
 from __future__ import annotations
 
