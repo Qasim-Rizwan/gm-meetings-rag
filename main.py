@@ -1,3 +1,11 @@
+# System SQLite3 override for ChromaDB (must be executed before any other import)
+try:
+    __import__('pysqlite3')
+    import sys
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+except ImportError:
+    pass
+
 import os
 import logging
 from contextlib import asynccontextmanager
@@ -100,13 +108,12 @@ class ChatResponse(BaseModel):
 async def health_check():
     """
     Azure App Service readiness and liveness probe.
-    Also reports if the RAG engine is fully loaded in memory.
+    IMPORTANT: Always returns 200 OK so Azure does NOT kill the container
+    during cold start (model loading takes ~60s on B1).
+    The 'engine' field indicates actual readiness.
     """
     if engine is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="RAG Engine is not initialized yet."
-        )
+        return {"status": "starting", "engine": "loading"}
     return {"status": "healthy", "engine": "loaded"}
 
 @app.post(

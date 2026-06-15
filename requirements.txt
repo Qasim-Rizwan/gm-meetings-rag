@@ -1,6 +1,12 @@
+# ─────────────────────────────────────────────────────────────
+# Requirements for Azure App Service (FastAPI API deployment)
+# ─────────────────────────────────────────────────────────────
+# NOTE: This file is read by Azure Oryx during deployment build.
+# torch is installed CPU-only via PRE_BUILD_COMMAND in Azure settings.
 
-# --- Web ---
-streamlit>=1.40.0,<2
+# --- FastAPI API Stack ---
+fastapi>=0.100.0,<1.0.0
+uvicorn[standard]>=0.22.0,<1.0.0
 
 # --- LangChain ---
 langchain>=1.2.0,<2
@@ -14,27 +20,22 @@ langchain-groq>=1.1.0,<2
 # --- Vector store ---
 chromadb>=1.0.0,<2
 
-# --- Embeddings / HF stack (downloads model on first run unless HF_OFFLINE=1) ---
+# --- Embeddings / HF stack ---
 sentence-transformers>=2.7.0
-torch>=2.0.0,<3
+# torch is handled separately — see PRE_BUILD_COMMAND in Azure
 transformers>=4.40.0
 huggingface_hub>=0.23.0
 
 # --- Hybrid retrieval (BM25 sparse search) ---
 rank-bm25>=0.2.2
 
-# --- LLM API (ingest --groq-vision; transitive for langchain-groq) ---
+# --- LLM API ---
 groq>=0.37.0
-
-# --- PDF + chart OCR (ingest.py; not required at runtime for Streamlit query-only) ---
-pypdf>=4.0.0
-pymupdf>=1.24.0
-pytesseract>=0.3.10
-Pillow>=10.0.0
 
 # --- Config / schema ---
 python-dotenv>=1.0.0
 pydantic>=2.0.0,<3
 
-# --- Compatibility fix (Streamlit Cloud / chromadb telemetry stack) ---
+# --- Compatibility fix ---
 protobuf>=3.20.3,<4.0.0
+pysqlite3-binary>=0.5.2

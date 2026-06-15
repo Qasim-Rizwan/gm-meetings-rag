@@ -1,21 +1,21 @@
 #!/bin/bash
 # Azure App Service Python Startup Script
+# SIMPLIFIED: No pip install here — Oryx handles it during deployment.
 
-# Log output
-echo "Azure App Service: Starting setup script..."
+echo "=== Azure App Service: Starting setup script ==="
+echo "Date: $(date)"
+echo "Python: $(python --version 2>&1)"
 
-# 1. Install FastAPI-specific dependencies (if Oryx build used the default requirements.txt)
-if [ -f "requirements-api.txt" ]; then
-    echo "Installing API-specific dependencies from requirements-api.txt..."
-    pip install --no-cache-dir -r requirements-api.txt
-else
-    echo "requirements-api.txt not found. Relying on default environment."
-fi
+# ── 1. Persistent Hugging Face model cache (survives restarts) ───────────────
+export HF_HOME="/home/site/hf_cache"
+export TRANSFORMERS_CACHE="/home/site/hf_cache"
+export SENTENCE_TRANSFORMERS_HOME="/home/site/hf_cache/sentence_transformers"
+mkdir -p "$HF_HOME"
 
-# 2. Resolve port (Azure App Service sets $PORT dynamically; default to 8000 for local)
+# ── 2. Resolve port (Azure sets $PORT dynamically; default 8000 for local) ──
 APP_PORT="${PORT:-8000}"
 echo "Configuring application to run on port: $APP_PORT"
 
-# 3. Boot Uvicorn with exec to forward OS signals cleanly
+# ── 3. Boot Uvicorn with exec to forward OS signals cleanly ─────────────────
 echo "Launching FastAPI application via Uvicorn..."
-exec uvicorn main:app --host 0.0.0.0 --port "$APP_PORT"
+exec uvicorn main:app --host 0.0.0.0 --port "$APP_PORT" --timeout-keep-alive 120
