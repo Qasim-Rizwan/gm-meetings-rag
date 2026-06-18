@@ -8,6 +8,7 @@ except ImportError:
 
 import os
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -23,21 +24,25 @@ logger = logging.getLogger("fastapi_app")
 # Global engine reference
 engine = None
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    FastAPI Lifespan Context Manager.
-    Initializes the RAG Engine once on startup and keeps it in memory as a singleton.
-    """
+def init_engine():
+    """Initializes the RAG engine in a background thread to prevent blocking Uvicorn startup."""
     global engine
-    logger.info("Initializing GM Meetings RAG Engine...")
+    logger.info("Initializing GM Meetings RAG Engine in background thread...")
     try:
         from rag import GMRagEngine
         engine = GMRagEngine()
         logger.info("RAG Engine successfully initialized.")
     except Exception as e:
         logger.error(f"CRITICAL: Failed to initialize RAG Engine: {e}", exc_info=True)
-        raise e
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI Lifespan Context Manager.
+    Initializes the RAG Engine in the background so the server can accept connections immediately.
+    """
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, init_engine)
     yield
     logger.info("Shutting down application...")
 
