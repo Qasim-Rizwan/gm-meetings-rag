@@ -2,7 +2,9 @@
 # Requirements for Azure App Service (FastAPI API deployment)
 # ─────────────────────────────────────────────────────────────
 # NOTE: This file is read by Azure Oryx during deployment build.
-# torch is installed CPU-only via PRE_BUILD_COMMAND in Azure settings.
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
 
 # --- FastAPI API Stack ---
 fastapi>=0.100.0,<1.0.0
