@@ -1,10 +1,5 @@
-# System SQLite3 override for ChromaDB (must be executed before any other import)
-try:
-    __import__('pysqlite3')
-    import sys
-    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
-except ImportError:
-    pass
+# NOTE: pysqlite3 override is applied in init_engine() AFTER packages are installed,
+# not here at module load time (pysqlite3-binary hasn't been pip-installed yet at this point).
 
 import os
 import sys
@@ -140,6 +135,17 @@ def init_engine():
     global engine, startup_status
     startup_status = "loading"
     logger.info("Loading GM Meetings RAG Engine...")
+
+    # Apply pysqlite3 override NOW — pysqlite3-binary is installed at this point.
+    # ChromaDB requires sqlite3 >= 3.35.0 but Azure's system sqlite3 is older.
+    # This replaces the built-in sqlite3 module with the newer pysqlite3 version.
+    try:
+        import pysqlite3
+        sys.modules['sqlite3'] = pysqlite3
+        logger.info("pysqlite3 override applied successfully.")
+    except ImportError:
+        logger.warning("pysqlite3 not available — ChromaDB may fail with old sqlite3.")
+
     try:
         from rag import GMRagEngine
         engine = GMRagEngine()
