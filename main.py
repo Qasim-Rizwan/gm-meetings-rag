@@ -230,19 +230,29 @@ def verify_api_key(
     if not provided and auth:
         provided = auth.credentials
 
+    # Clean standard-parsed token
+    if provided:
+        provided = provided.strip().strip('"').strip("'")
+
     # Check 3: Raw Authorization header (in case the client sent it without 'Bearer ' prefix
     # or if the HTTPBearer scheme did not parse it correctly)
     if not provided:
         auth_hdr = request.headers.get("authorization")
         if auth_hdr:
+            auth_hdr = auth_hdr.strip().strip('"').strip("'")
             if auth_hdr.lower().startswith("bearer "):
-                provided = auth_hdr[7:].strip()
+                provided = auth_hdr[7:].strip().strip('"').strip("'")
             else:
-                provided = auth_hdr.strip()
+                provided = auth_hdr
 
-    if not provided or provided != token:
+    # Final double check: strip any remaining quotes in expected or provided
+    expected_token = token.strip().strip('"').strip("'") if token else ""
+    if provided:
+        provided = provided.strip().strip('"').strip("'")
+
+    if not provided or provided != expected_token:
         # Safe obfuscated debugging log
-        expected_part = token[:4] if token else "None"
+        expected_part = expected_token[:4] if expected_token else "None"
         provided_part = provided[:4] if provided else "None"
         logger.warning(
             f"Verification failed. Provided: '{provided_part}...', "
