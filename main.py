@@ -9,7 +9,7 @@ import subprocess
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Security, status, Depends
+from fastapi import FastAPI, HTTPException, Security, status, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -214,6 +214,7 @@ security_bearer = HTTPBearer(auto_error=False)
 
 
 def verify_api_key(
+    request: Request,
     x_api_key: Optional[str] = Security(api_key_header),
     auth: Optional[HTTPAuthorizationCredentials] = Security(security_bearer),
 ):
@@ -221,8 +222,32 @@ def verify_api_key(
     if not token:
         logger.warning("API_ACCESS_TOKEN not set — running UNSECURED.")
         return
-    provided = x_api_key or (auth.credentials if auth else None)
+
+    # Check 1: APIKeyHeader / X-API-Key
+    provided = x_api_key
+
+    # Check 2: HTTPBearer
+    if not provided and auth:
+        provided = auth.credentials
+
+    # Check 3: Raw Authorization header (in case the client sent it without 'Bearer ' prefix
+    # or if the HTTPBearer scheme did not parse it correctly)
+    if not provided:
+        auth_hdr = request.headers.get("authorization")
+        if auth_hdr:
+            if auth_hdr.lower().startswith("bearer "):
+                provided = auth_hdr[7:].strip()
+            else:
+                provided = auth_hdr.strip()
+
     if not provided or provided != token:
+        # Safe obfuscated debugging log
+        expected_part = token[:4] if token else "None"
+        provided_part = provided[:4] if provided else "None"
+        logger.warning(
+            f"Verification failed. Provided: '{provided_part}...', "
+            f"Expected: '{expected_part}...', Len provided: {len(provided) if provided else 0}"
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing API token."
