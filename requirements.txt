@@ -1,44 +1,8 @@
 # ─────────────────────────────────────────────────────────────
-# Requirements for Azure App Service (FastAPI API deployment)
+# DEBUG requirements — minimal install to verify server works
+# Full package list will be restored once debug is confirmed
 # ─────────────────────────────────────────────────────────────
-# NOTE: This file is read by Azure Oryx during deployment build.
 
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.3.1+cpu
-
-# --- FastAPI API Stack ---
 fastapi>=0.100.0,<1.0.0
 uvicorn[standard]>=0.22.0,<1.0.0
-
-# --- LangChain ---
-langchain>=1.2.0,<2
-langchain-community>=0.4.0
-langchain-core>=1.2.0,<2
-langchain-text-splitters>=1.1.0,<2
-langchain-huggingface>=1.2.0,<2
-langchain-chroma>=1.1.0,<2
-langchain-groq>=1.1.0,<2
-
-# --- Vector store ---
-chromadb>=1.0.0,<2
-
-# --- Embeddings / HF stack ---
-sentence-transformers>=2.7.0
-# torch is handled separately — see PRE_BUILD_COMMAND in Azure
-transformers>=4.40.0
-huggingface_hub>=0.23.0
-
-# --- Hybrid retrieval (BM25 sparse search) ---
-rank-bm25>=0.2.2
-
-# --- LLM API ---
-groq>=0.37.0
-
-# --- Config / schema ---
-python-dotenv>=1.0.0
 pydantic>=2.0.0,<3
-
-# --- Compatibility fix ---
-numpy<2
-protobuf>=3.20.3,<4.0.0
-pysqlite3-binary>=0.5.2
