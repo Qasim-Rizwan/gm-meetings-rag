@@ -32,21 +32,31 @@ startup_error = ""            # human-readable error message if status == error
 PIP_CACHE_DIR = "/home/site/pip-cache"
 
 
+CONSTRAINTS_FILE = "/tmp/torch_constraints.txt"
+
+
 def _run_pip(step_name: str, *args):
-    """Run a pip install command, logging stdout/stderr on failure."""
+    """Run a pip install command with consistent torch pinning."""
+    # Write/refresh constraints file so torch is NEVER upgraded to a CUDA build
+    with open(CONSTRAINTS_FILE, "w") as f:
+        f.write("torch==2.3.1+cpu\n")
+
     cmd = [
         sys.executable, "-m", "pip", "install",
         "--cache-dir", PIP_CACHE_DIR,
         "--prefer-binary",
         "--quiet",
+        "--extra-index-url", "https://download.pytorch.org/whl/cpu",
+        "--constraint", CONSTRAINTS_FILE,
     ] + list(args)
     logger.info(f"[{step_name}] pip install {' '.join(str(a) for a in args[:3])}...")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     if result.returncode != 0:
         err = result.stderr[-3000:] if result.stderr else result.stdout[-3000:]
         logger.error(f"[{step_name}] FAILED:\n{err}")
-        raise RuntimeError(f"pip install failed at step '{step_name}': {err[-200:]}")
+        raise RuntimeError(f"pip install failed at step '{step_name}': {err[-300:]}")
     logger.info(f"[{step_name}] done.")
+
 
 
 def _already_installed() -> bool:
@@ -81,15 +91,15 @@ def ensure_packages():
     os.makedirs(PIP_CACHE_DIR, exist_ok=True)
 
     # ── Step 1: CPU-only PyTorch ──────────────────────────────────────────────
-    # Must use --extra-index-url so pip finds the +cpu variant on PyTorch CDN.
-    _run_pip("torch-cpu",
-             "torch==2.3.1+cpu",
-             "--extra-index-url", "https://download.pytorch.org/whl/cpu")
+    # --extra-index-url + ==2.3.1+cpu ensures the CPU wheel is used.
+    # The +cpu local version is only on PyTorch's CDN, not on PyPI.
+    _run_pip("torch-cpu", "torch==2.3.1+cpu")
+
 
     # ── Step 2: Core NLP stack ────────────────────────────────────────────────
     _run_pip("nlp-stack",
              "sentence-transformers>=2.7.0",
-             "transformers>=4.40.0",
+             "transformers==4.41.2",
              "huggingface_hub>=0.23.0",
              "numpy<2")
 
