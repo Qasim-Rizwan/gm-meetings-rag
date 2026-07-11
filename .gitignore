@@ -23,3 +23,6 @@ build/
 # ChromaDB vector index — excluded from git for security.
 # The index lives only on the server/locally and is never committed to the repo.
 chroma_db/
+
+# Raw PDF documents folder — excluded from git for security.
+"GM 2022 - External Folder"/
