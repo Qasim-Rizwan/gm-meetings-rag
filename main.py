@@ -21,6 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fastapi_app")
 
+
 # ── Global State ──────────────────────────────────────────────────────────────
 engine = None
 startup_status = "starting"   # starting | installing | loading | healthy | error
