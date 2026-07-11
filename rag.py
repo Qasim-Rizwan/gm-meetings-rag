@@ -785,13 +785,26 @@ class GMRagEngine:
         question: str,
         year_filter:     Optional[str] = None,
         doc_type_filter: Optional[str] = None,
+        context:         Optional[str] = None,
     ) -> GMResponse:
         """
         Full pipeline query.
         year_filter / doc_type_filter override the auto-detected values
         (useful when called from the Streamlit UI).
+        If context is provided directly, we skip ChromaDB retrieval and reranking.
         """
         query_ctx = self.query_analyzer.analyze(question)
+
+        if context:
+            logger.info("Context provided directly — bypassing ChromaDB retrieval.")
+            response = self.generator.generate(
+                question,
+                context,
+                structure_hint=query_ctx.structure_hint,
+            )
+            if not response.sources:
+                response.sources = ["Copilot Studio Knowledge Source"]
+            return response
 
         # Explicit UI overrides win over auto-detected values
         if year_filter:

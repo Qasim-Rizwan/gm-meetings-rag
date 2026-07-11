@@ -268,6 +268,7 @@ def verify_api_key(
 # ── Schemas ───────────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str = Field(..., example="What were the key decisions in the 2024 GM meeting?")
+    context: Optional[str] = Field(None, example="These are the context snippets retrieved from Copilot...")
 
 
 class ChatResponse(BaseModel):
@@ -308,7 +309,8 @@ async def chat_endpoint(request: ChatRequest):
         )
     try:
         logger.info(f"Query: {request.message[:80]}...")
-        result = engine.query(request.message)
+        result = engine.query(request.message, context=request.context)
+
         if not result or not result.answer:
             raise HTTPException(status_code=500, detail="Engine returned empty response.")
         return ChatResponse(response=result.answer)
