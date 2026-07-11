@@ -731,12 +731,8 @@ class GMRagEngine:
         self._load_components()
 
     def _check_index(self) -> None:
-        if not Path(CHROMA_DIR).exists():
-            print(
-                "\n[ERROR] ChromaDB index not found.\n"
-                "        Run  python ingest.py --rebuild  first.\n"
-            )
-            sys.exit(1)
+        # Create directory if it doesn't exist to allow booting with a clean/empty database
+        Path(CHROMA_DIR).mkdir(parents=True, exist_ok=True)
 
     def _load_components(self) -> None:
         print("[RAG] Loading embedding model …")
